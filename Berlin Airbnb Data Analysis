@@ -1,0 +1,422 @@
+import pandas as pd
+import numpy as np
+
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as fn, Row
+from pyspark.ml import feature, clustering, regression, evaluation, Pipeline, classification
+from pyspark.sql.types import StructField, StringType, FloatType, StructType, IntegerType
+from pyspark.sql.functions import udf
+from pyspark.ml.classification import LogisticRegression, RandomForestClassifier
+
+import matplotlib
+import matplotlib.pyplot as plt
+
+spark = SparkSession.builder.getOrCreate()
+sc = spark.sparkContext
+
+lis_sum = pd.read_csv("listings_summary.csv")
+
+lis_sum.head()
+
+#Listing all the columns
+lis_sum.columns
+
+#keeping relevant columns
+columns = ['id','host_id','host_response_time','host_listings_count','host_total_listings_count','neighbourhood_group_cleansed',
+                   'property_type', 'room_type', 'accommodates','bathrooms', 'bedrooms', 'beds', 'bed_type','price',
+                   'security_deposit','cleaning_fee','number_of_reviews',
+                   'review_scores_rating', 'cancellation_policy','extra_people','minimum_nights','maximum_nights',
+                   'availability_30', 'availability_60', 'availability_90',
+                   'availability_365','host_is_superhost','host_has_profile_pic', 'host_identity_verified',
+                   'is_location_exact','requires_license','instant_bookable','require_guest_profile_picture', 
+                   'require_guest_phone_verification', 'guests_included']
+
+df = lis_sum[columns].set_index('id')
+
+df.head()
+
+#Calculating the NA values in each column
+df.isna().sum()
+
+#Since there are alot of NA values in the host_response_time, we delete that column
+df.drop(columns=['host_response_time'],inplace=True)
+
+#Replacing the NA values in the Security Deposit Column and Cleaning Fee column by 0
+df.security_deposit.fillna('$0.00',inplace=True)
+df.cleaning_fee.fillna('$0.00',inplace=True)
+
+df.head()
+
+#Removing rows from the following columns which have less number of missing values
+df.dropna(subset=['bathrooms','bedrooms','beds','review_scores_rating','host_is_superhost','host_listings_count','host_total_listings_count','host_has_profile_pic','host_identity_verified'],inplace=True)
+
+df
+
+# clean up the columns (by method chaining)
+df.price = df.price.astype(str).str.replace('$', '').str.replace(',', '').astype(float)
+df.extra_people = df.extra_people.astype(str).str.replace('$', '').str.replace(',', '').astype(float)
+df.cleaning_fee = df.cleaning_fee.astype(str).str.replace('$', '').str.replace(',', '').astype(float)
+df.security_deposit = df.security_deposit.astype(str).str.replace('$', '').str.replace(',', '').astype(float)
+
+df['price'].describe()
+
+import matplotlib.pyplot as plt
+%matplotlib inline 
+
+from matplotlib import rcParams
+rcParams['figure.figsize'] = 12, 9
+import seaborn as sns
+#sns.jointplot(x="review_scores_rating", y="price", data=df)
+sns.scatterplot(x="review_scores_rating", y="price", data=df)
+
+df_new = pd.DataFrame(df.groupby('neighbourhood_group_cleansed')['price'].mean())
+
+df_new
+
+df_new['neighbourhood_group_cleansed'] = df_new.index
+ax=sns.barplot(x="neighbourhood_group_cleansed", y="price", data=df_new)
+ax.set_xticklabels(ax.get_xticklabels(), rotation=90)
+
+sns.lineplot(x="number_of_reviews", y="price", data=df)
+
+lis_sum.columns
+
+## PCA Analysis ##
+#Removing the categorical columns
+columns_for_PCA = ['host_listings_count','accommodates','bathrooms', 'bedrooms', 'beds', 'price',
+                   'security_deposit','cleaning_fee','guests_included', 'extra_people', 'minimum_nights',
+                   'maximum_nights','availability_30', 'availability_60', 'availability_90',
+                   'availability_365','number_of_reviews','review_scores_rating']
+
+df_feat = df[columns_for_PCA]
+
+df_centered = df_feat.apply(lambda x: x - x.mean())
+df_spark = spark.createDataFrame(df_centered)
+training_df, validation_df, testing_df = df_spark.randomSplit([0.6, 0.3, 0.1], seed=0)
+df_centered.head()
+
+# Building pipeline
+va = feature.VectorAssembler(inputCols = ['host_listings_count','accommodates','bathrooms', 'bedrooms', 'beds', 'price',
+                   'security_deposit','cleaning_fee','guests_included', 'extra_people', 'minimum_nights',
+                   'maximum_nights','availability_30', 'availability_60', 'availability_90',
+                   'availability_365','number_of_reviews','review_scores_rating'], 
+                             outputCol = 'features')
+scaler = feature.MaxAbsScaler(inputCol = 'features', outputCol = 'scaled_features')
+pca = feature.PCA(k=18, inputCol="scaled_features", outputCol="pca_features")
+
+pca_pipe = Pipeline(stages=[va, scaler, pca]).fit(training_df)
+
+model = pca_pipe.stages[-1]
+model.explainedVariance
+
+y = model.explainedVariance
+x = list(range(1, 19))
+z = list(y)
+
+for i in range(1, 18):
+    z[i] = sum(list(y)[:(i+1)])
+
+plt.plot(x, z)
+
+pca_main = feature.PCA(k=5, inputCol="scaled_features", outputCol="pca_features")
+pca_pipe_final = Pipeline(stages=[va, scaler, pca_main]).fit(training_df)
+
+model_main = pca_pipe_final.stages[-1]
+
+rows = model_main.pc.toArray().tolist()
+df_pc = spark.createDataFrame(rows, ['PC' + str(i) for i in range(1, 6)]).toPandas()
+df_pc['Feature'] = ['host_listings_count','accommodates','bathrooms', 'bedrooms', 'beds', 'price',
+                   'security_deposit','cleaning_fee','guests_included', 'extra_people', 'minimum_nights',
+                   'maximum_nights','availability_30', 'availability_60', 'availability_90',
+                   'availability_365','number_of_reviews','review_scores_rating']
+feature_col = df_pc.pop('Feature')
+df_pc.insert(0, 'Feature', feature_col)
+
+df_pc
+
+pc1 = df_pc[['Feature', 'PC1']]
+pc1['Weight'] = pc1['PC1'].apply(lambda x: abs(x))
+pc1.drop('PC1', axis=1, inplace=True)
+pc1.sort_values('Weight', ascending=False)
+
+pc2 = df_pc[['Feature', 'PC2']]
+pc2['Weight'] = pc2['PC2'].apply(lambda x: abs(x))
+pc2.drop('PC2', axis=1, inplace=True)
+pc2.sort_values('Weight', ascending=False)
+
+pc3 = df_pc[['Feature', 'PC3']]
+pc3['Weight'] = pc3['PC3'].apply(lambda x: abs(x))
+pc3.drop('PC3', axis=1, inplace=True)
+pc3.sort_values('Weight', ascending=False)
+
+pc4 = df_pc[['Feature', 'PC4']]
+pc4['Weight'] = pc4['PC4'].apply(lambda x: abs(x))
+pc4.drop('PC4', axis=1, inplace=True)
+pc4.sort_values('Weight', ascending=False)
+
+pc5 = df_pc[['Feature', 'PC5']]
+pc5['Weight'] = pc5['PC5'].apply(lambda x: abs(x))
+pc5.drop('PC5', axis=1, inplace=True)
+pc5.sort_values('Weight', ascending=False)
+
+pc_data = training_df.toPandas()
+weights_top3 = df_pc.drop(['Feature', 'PC4', 'PC5'], axis = 1)
+pc_3 = pd.DataFrame(np.dot(pc_data, weights_top3), columns=['PC1', 'PC2', 'PC3'])
+
+pc_df = spark.createDataFrame(pc_3)
+
+pipe_kmeans = Pipeline(stages=[
+    feature.VectorAssembler(inputCols=['PC1', 'PC2', 'PC3'], outputCol='kmeansFeatures'),
+    clustering.KMeans(k=3, featuresCol='kmeansFeatures', predictionCol='cluster')
+]).fit(pc_df)
+
+kmeans_df = pipe_kmeans.transform(pc_df).toPandas()
+
+from mpl_toolkits.mplot3d import Axes3D
+
+# %matplotlib notebook
+
+plt_df = kmeans_df.sample(1000)
+
+fig = plt.figure(figsize=(9, 9))
+ax = fig.add_subplot(111, projection='3d')
+ax.set_xlabel('PC1')
+ax.set_ylabel('PC2')
+ax.set_zlabel('PC3')
+
+ax.scatter(plt_df['PC1'], plt_df['PC2'], plt_df['PC3'], 
+           c=plt_df['cluster'],
+           cmap=matplotlib.colors.ListedColormap(['green', 'red', 'blue']))
+           
+## Logistic regression with numberical features ##
+
+del training_df, validation_df, testing_df
+
+df_orig = spark.createDataFrame(df_feat)
+training_df, validation_df, testing_df = df_orig.randomSplit([0.6, 0.3, 0.1], seed=0)
+
+training_df.toPandas().review_scores_rating.hist()
+plt.xlabel('rating')
+
+feature.Bucketizer(splits=[0, 95, 100], inputCol='review_scores_rating').transform(training_df).toPandas().iloc[:, -1].hist()
+plt.xticks([-1, 0, 1, 2]);
+plt.xlabel('Review score rating buckets')
+
+data = feature.Bucketizer(splits=[0, 95, 100], inputCol='review_scores_rating', outputCol='label').transform(training_df)
+data.printSchema()
+
+data.columns[:-2]
+
+data.count()
+len(data.columns)
+
+va = feature.VectorAssembler().setInputCols(data.columns[:-2]).setOutputCol('features')
+
+from pyspark.ml.classification import LogisticRegression, RandomForestClassifier
+lambda_par = 0.01
+alpha_par = 0.2
+en_lr = LogisticRegression().\
+        setLabelCol('label').\
+        setFeaturesCol('features').\
+        setRegParam(lambda_par).\
+        setMaxIter(100).\
+        setElasticNetParam(alpha_par)
+en_lr_estimator = Pipeline(
+    stages=[va, en_lr])
+en_lr_pipeline = en_lr_estimator.fit(data)
+
+validation_data = feature.Bucketizer(splits=[0, 95, 100], inputCol='review_scores_rating', outputCol='label').transform(validation_df)
+en_lr_pipeline.transform(validation_data).select(fn.avg(fn.expr('float(prediction = label)')).alias('en_lr_accuracy')).show()
+
+rf_pipeline = Pipeline(stages=[va, RandomForestClassifier()]).fit(data)
+rf_pipeline.transform(validation_data).select(fn.avg(fn.expr('float(prediction = label)')).alias('rf_accuracy')).show()
+
+testing_data = feature.Bucketizer(splits=[0, 95, 100], inputCol='review_scores_rating', outputCol='label').transform(testing_df)
+en_lr_pipeline.transform(testing_data).select(fn.avg(fn.expr('float(prediction = label)')).alias('en_lr_accuracy_testing')).show()
+rf_pipeline.transform(testing_data).select(fn.avg(fn.expr('float(prediction = label)')).alias('rf_accuracy_testing')).show()
+
+## Review NLP analysis ##
+
+!pip install langdetect
+
+from langdetect import detect
+review_sum = pd.read_csv("reviews_summary.csv")
+review_sum.head(10)
+def new_detect(text):
+    lang_list = ['af','ar','bg','bn','ca','cs','cy','da','de','el', 'en', 'es', 'et', 'fa', 'fi', 'fr', 'gu', 'he', 'hi', 'hr', 'hu', 'id', 'it', 'ja', 'kn',' ko','lt', 'lv', 'mk', 'ml', 'mr', 'ne', 'nl', 'no', 'pa', 'pl', 'pt', 'ro', 'ru', 'sk', 'sl', 'so', 'sq', 'sv', 'sw', 'ta', 'te', 'th', 'tl', 'tr', 'uk', 'ur', 'vi', 'zh-cn', 'zh-tw']
+    try:
+        if detect(text) in lang_list:
+            return detect(text)
+    except:
+        return None
+        
+comments = review_sum['comments'].astype(str)
+
+_schema = StructType([StructField("listing_id", IntegerType(), True),
+                      StructField("id", IntegerType(), True),
+                      StructField("comments", StringType(), True)])
+df_comments = spark.createDataFrame(review_sum[['listing_id', 'id', 'comments']], _schema)
+
+comment_detect = udf(new_detect, StringType())
+df_comment_with_lang = df_comments.withColumn('lang_detected', comment_detect('comments'))
+
+df_comment_with_lang.toPandas().to_csv("comment_with_lang_new.csv", header=True)
+
+# reviews = pd.read_csv('reviews_summary.csv')
+reviews = pd.read_csv('comment_with_lang_new.csv')
+listings = pd.read_csv('listings_summary.csv')
+
+listing_score = listings[['id', 'review_scores_rating']]
+listing_score = listing_score.drop_duplicates('id')
+listing_score = listing_score.rename(columns={'id': 'listing_id'})
+
+reviews = reviews.merge(listing_score, how='left', on='listing_id')
+en = reviews.loc[reviews['lang_detected'] == 'en'][['listing_id', 'id', 'comments', 'review_scores_rating']]
+de = reviews.loc[reviews['lang_detected'] == 'de'][['listing_id', 'id', 'comments', 'review_scores_rating']]
+
+en.head()
+de.head()
+
+# combining comments by listing
+
+en_list = []
+for listing in list(set(en['listing_id'])):
+    tmp = en.loc[en['listing_id'] == listing]
+    comments = list(tmp['comments'])
+    combined = ' '.join(comments)
+    en_list.append([tmp.iloc[0][0], combined, tmp.iloc[0][3]])
+
+en_new = pd.DataFrame(en_list, columns=['listing_id', 'comments', 'review_scores_rating']).sort_values('listing_id')
+
+en_new.shape
+
+# same for German comments
+
+de_list = []
+for listing in list(set(de['listing_id'])):
+    tmp = de.loc[de['listing_id'] == listing]
+    comments = list(tmp['comments'])
+    combined = ' '.join(comments)
+    de_list.append([tmp.iloc[0][0], combined, tmp.iloc[0][3]])
+
+de_new = pd.DataFrame(de_list, columns=['listing_id', 'comments', 'review_scores_rating']).sort_values('listing_id')
+
+de_new.shape
+
+df_en = spark.createDataFrame(en_new)
+df_de = spark.createDataFrame(de_new)
+
+# feature engineering: classify the ratings by 95
+df_en2 = df_en.select('listing_id', 'comments',
+    fn.when(fn.col('review_scores_rating') >= 96, 1).otherwise(0).alias('is_high_rating'))
+
+df_de2 = df_de.select('listing_id', 'comments',
+    fn.when(fn.col('review_scores_rating') >= 96, 1).otherwise(0).alias('is_high_rating'))
+    
+# todo: check any duplicate df name
+training_en, validation_en, testing_en = df_en2.randomSplit([0.6, 0.3, 0.1], seed=0)
+training_de, validation_de, testing_de = df_de2.randomSplit([0.6, 0.3, 0.1], seed=0)
+
+training_en.show()
+training_en.toPandas().shape
+
+training_en.toPandas().groupby('is_high_rating').size()
+
+tfidf_pipe = Pipeline(stages = [
+    feature.Tokenizer(inputCol = 'comments', outputCol = 'words'),
+    feature.CountVectorizer(inputCol = 'words', outputCol = 'tf'),
+    feature.IDF(inputCol = 'tf', outputCol = 'tfidf')]).fit(training_en)
+
+tfidf_pipe.transform(training_en).show()
+
+# LR
+
+lr_pipeline1 = Pipeline(stages=[
+    tfidf_pipe,
+    classification.LogisticRegression(featuresCol='tfidf', labelCol='is_high_rating',
+                                      regParam=0, elasticNetParam=0)
+]).fit(training_en)
+
+evaluator = evaluation.BinaryClassificationEvaluator(labelCol='is_high_rating')
+AUC = evaluator.evaluate(lr_pipeline1.transform(validation_en))
+print("Model AUC: ", AUC)
+
+# LR 2
+
+lr_pipeline2 = Pipeline(stages=[
+    tfidf_pipe,
+    classification.LogisticRegression(featuresCol='tfidf', labelCol='is_high_rating',
+                                      regParam=0.02, elasticNetParam=0.2)
+]).fit(training_en)
+
+evaluator = evaluation.BinaryClassificationEvaluator(labelCol='is_high_rating')
+AUC = evaluator.evaluate(lr_pipeline2.transform(validation_en))
+print("Model AUC: ", AUC)
+
+# LR 3
+
+lr_pipeline3 = Pipeline(stages=[
+    tfidf_pipe,
+    classification.LogisticRegression(featuresCol='tfidf', labelCol='is_high_rating',
+                                      regParam=0.01, elasticNetParam=0.2)
+]).fit(training_en)
+
+evaluator = evaluation.BinaryClassificationEvaluator(labelCol='is_high_rating')
+AUC = evaluator.evaluate(lr_pipeline3.transform(validation_en))
+print("Model AUC: ", AUC)
+
+# test
+# best model is model 2
+
+evaluator = evaluation.BinaryClassificationEvaluator(labelCol='is_high_rating')
+AUC = evaluator.evaluate(lr_pipeline2.transform(testing_en))
+print("Model AUC: ", AUC)
+
+# keywords
+
+vocabulary = lr_pipeline2.stages[0].stages[1].vocabulary
+weights = lr_pipeline2.stages[-1].coefficients.toArray()
+positive_words = pd.DataFrame({'word': vocabulary, 'weight': weights}).sort_values('weight', ascending=False)[:20]
+negative_words = pd.DataFrame({'word': vocabulary, 'weight': weights}).sort_values('weight', ascending=True)[:20]
+
+positive_words_96 = positive_words
+negative_words_96 = negative_words
+
+positive_words_96.head(20)
+negative_words_96.head(20)
+
+tfidf_pipe_de = Pipeline(stages = [
+    feature.Tokenizer(inputCol = 'comments', outputCol = 'words'),
+    feature.CountVectorizer(inputCol = 'words', outputCol = 'tf'),
+    feature.IDF(inputCol = 'tf', outputCol = 'tfidf')]).fit(training_de)
+    
+# LR 2
+
+lr_pipeline2_de = Pipeline(stages=[
+    tfidf_pipe_de,
+    classification.LogisticRegression(featuresCol='tfidf', labelCol='is_high_rating',
+                                      regParam=0.02, elasticNetParam=0.2)
+]).fit(training_de)
+
+evaluator = evaluation.BinaryClassificationEvaluator(labelCol='is_high_rating')
+AUC = evaluator.evaluate(lr_pipeline2_de.transform(validation_de))
+print("Model AUC: ", AUC)
+
+# keywords
+
+vocabulary = lr_pipeline2_de.stages[0].stages[1].vocabulary
+weights = lr_pipeline2_de.stages[-1].coefficients.toArray()
+positive_words_de = pd.DataFrame({'word': vocabulary, 'weight': weights}).sort_values('weight', ascending=False)[:20]
+negative_words_de = pd.DataFrame({'word': vocabulary, 'weight': weights}).sort_values('weight', ascending=True)[:20]
+
+positive_words_de.head(20)
+positive_words_de_10 = positive_words_de.iloc[0:10]
+positive_words_de_10
+
+positive_words_de_10.insert(1, 'English',
+                         ['romped', 'Parquet floors', 'luxurious',
+                         'naked', 'reasonable', 'modern', 'quality',
+                         'seminar weekend', 'above-mentioned', 'hesitate'])
+                         
+positive_words_de_10
+
